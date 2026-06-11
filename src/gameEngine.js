@@ -4,6 +4,8 @@ export const ROWS = 23
 export const TICK_MS = 150
 export const GHOST_TICK_MS = 360
 export const SCARED_MS = 8000
+export const MISSILE_TICK_MS = 80       // missile moves every 80 ms
+export const MISSILE_KILL_SCORE = 300   // score bonus for a missile ghost kill
 
 export const GHOST_NAMES = ['Blaze', 'Nimbus', 'Glitch', 'Dusk']
 
@@ -123,7 +125,7 @@ export function resolvePlayerGhostCollision(ghost, player) {
 /**
  * Creates the initial game state from the maze data returned by generateMaze.
  */
-export function initGameState({ grid, playerStart, ghostStarts, pathCells, powerPellets, ghostHouseCenter }) {
+export function initGameState({ grid, playerStart, ghostStarts, pathCells, powerPellets, ghostHouseCenter, missilePacks = [] }) {
   const ghostColors = ['#FF0000', '#FFB8FF', '#00FFFF', '#FFB852']
 
   return {
@@ -136,6 +138,7 @@ export function initGameState({ grid, playerStart, ghostStarts, pathCells, power
       nextDir: { dx: 1, dy: 0 },
       mouthAngle: 0.25,
       mouthOpen: true,
+      missiles: 1,
     },
     ghosts: ghostStarts.slice(0, 4).map((pos, i) => ({
       x: pos.x,
@@ -154,6 +157,8 @@ export function initGameState({ grid, playerStart, ghostStarts, pathCells, power
     lives: 3,
     phase: 'playing',
     dyingTimer: 0,
+    activeMissiles: [],   // { x, y, dx, dy }[]
+    missilePacks: new Set(missilePacks.map(c => `${c.x},${c.y}`)),
     totalPellets: pathCells.length,
   }
 }

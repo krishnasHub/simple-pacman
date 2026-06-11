@@ -129,6 +129,46 @@ export function generateMaze(cols = 23, rows = 23) {
     }
   }
 
+  // Missile pack locations — more in the centre, less on the edges
+  function inGhostHouseOrEntrance(x, y) {
+    return x >= 9 && x <= 13 && y >= 8 && y <= 12;
+  }
+
+  function nearPlayer(x, y, px, py, radius = 3) {
+    return Math.abs(x - px) + Math.abs(y - py) <= radius;
+  }
+
+  function shuffleArr(arr) {
+    for (let i = arr.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [arr[i], arr[j]] = [arr[j], arr[i]];
+    }
+    return arr;
+  }
+
+  // Cells eligible for missile packs (not ghost house, not too close to player)
+  const eligibleCells = pathCells.filter(c =>
+    !inGhostHouseOrEntrance(c.x, c.y) &&
+    !nearPlayer(c.x, c.y, playerStart.x, playerStart.y) &&
+    !(c.x === 11 && c.y === 0) &&   // exclude portal cells
+    !(c.x === 11 && c.y === 22) &&
+    !(c.x === 0  && c.y === 11) &&
+    !(c.x === 22 && c.y === 11)
+  );
+
+  const centerDist = c => Math.abs(c.x - 11) + Math.abs(c.y - 11);
+
+  // Inner zone: Manhattan dist ≤ 7 from centre (ghost house area excluded above)
+  const innerZone = shuffleArr(eligibleCells.filter(c => centerDist(c) <= 7));
+  // Outer zone: further from centre
+  const outerZone = shuffleArr(eligibleCells.filter(c => centerDist(c) > 7));
+
+  // 6 packs from inner zone (higher risk/reward), 3 from outer zone
+  const missilePacks = [
+    ...innerZone.slice(0, 6),
+    ...outerZone.slice(0, 3),
+  ];
+
   return {
     grid,
     playerStart,
@@ -136,5 +176,6 @@ export function generateMaze(cols = 23, rows = 23) {
     pathCells,
     powerPellets: uniquePowerPellets,
     ghostHouseCenter: { x: 11, y: 11 },
+    missilePacks,
   };
 }

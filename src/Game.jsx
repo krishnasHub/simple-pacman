@@ -7,6 +7,8 @@ import {
   TICK_MS,
   GHOST_TICK_MS,
   SCARED_MS,
+  MISSILE_TICK_MS,
+  MISSILE_KILL_SCORE,
   canMove,
   getWrappedPosition,
   bfsStep,
@@ -111,6 +113,58 @@ function drawPowerPellets(ctx, powerPellets) {
     ctx.beginPath()
     ctx.arc(x * CS + CS / 2, y * CS + CS / 2, 6, 0, Math.PI * 2)
     ctx.fill()
+  }
+}
+
+function drawMissilePacks(ctx, missilePacks) {
+  for (const key of missilePacks) {
+    const [x, y] = key.split(',').map(Number)
+    const cx = x * CS + CS / 2
+    const cy = y * CS + CS / 2
+    ctx.save()
+    ctx.shadowBlur = 10
+    ctx.shadowColor = '#ff6600'
+    ctx.fillStyle = '#ff8c00'
+    // Draw a diamond shape
+    ctx.beginPath()
+    ctx.moveTo(cx, cy - 7)
+    ctx.lineTo(cx + 5, cy)
+    ctx.lineTo(cx, cy + 7)
+    ctx.lineTo(cx - 5, cy)
+    ctx.closePath()
+    ctx.fill()
+    // Inner highlight
+    ctx.fillStyle = '#ffcc44'
+    ctx.beginPath()
+    ctx.moveTo(cx, cy - 4)
+    ctx.lineTo(cx + 3, cy)
+    ctx.lineTo(cx, cy + 4)
+    ctx.lineTo(cx - 3, cy)
+    ctx.closePath()
+    ctx.fill()
+    ctx.restore()
+  }
+}
+
+function drawActiveMissiles(ctx, missiles) {
+  for (const m of missiles) {
+    const cx = m.x * CS + CS / 2
+    const cy = m.y * CS + CS / 2
+    ctx.save()
+    ctx.shadowBlur = 14
+    ctx.shadowColor = '#ffaa00'
+    // Outer glow circle
+    ctx.fillStyle = '#ffdd00'
+    ctx.beginPath()
+    ctx.arc(cx, cy, 5, 0, Math.PI * 2)
+    ctx.fill()
+    // Bright core
+    ctx.shadowBlur = 0
+    ctx.fillStyle = '#ffffff'
+    ctx.beginPath()
+    ctx.arc(cx, cy, 2.5, 0, Math.PI * 2)
+    ctx.fill()
+    ctx.restore()
   }
 }
 
@@ -238,6 +292,8 @@ function renderFrame(canvas, state) {
   drawMaze(ctx, state.grid)
   drawPellets(ctx, state.pellets)
   drawPowerPellets(ctx, state.powerPellets)
+  drawMissilePacks(ctx, state.missilePacks)
+  drawActiveMissiles(ctx, state.activeMissiles)
   drawGhosts(ctx, state.ghosts)
   drawPlayer(ctx, state.player, state.phase)
 }
@@ -255,9 +311,10 @@ export default function Game() {
 
   const lastPlayerTickRef = useRef(0)
   const lastGhostTickRef = useRef(0)
-  const lastUiRef = useRef({ score: 0, lives: 3, phase: 'playing' })
+  const lastMissileTickRef = useRef(0)
+  const lastUiRef = useRef({ score: 0, lives: 3, phase: 'playing', missiles: 1 })
 
-  const [ui, setUi] = useState({ score: 0, lives: 3, phase: 'playing' })
+  const [ui, setUi] = useState({ score: 0, lives: 3, phase: 'playing', missiles: 1 })
   const [ghostPanel, setGhostPanel] = useState([])
   const [phraseIdx, setPhraseIdx] = useState(0)
 
@@ -270,13 +327,15 @@ export default function Game() {
     const playerKey = `${state.player.x},${state.player.y}`
     state.pellets.delete(playerKey)
     state.powerPellets.delete(playerKey)
+    state.missilePacks.delete(playerKey)
 
     stateRef.current = state
     pendingDirRef.current = { dx: 0, dy: 0, pending: false }
     lastPlayerTickRef.current = 0
     lastGhostTickRef.current = 0
+    lastMissileTickRef.current = 0
 
-    const initialUi = { score: 0, lives: 3, phase: 'playing' }
+    const initialUi = { score: 0, lives: 3, phase: 'playing', missiles: 1 }
     lastUiRef.current = initialUi
     setUi(initialUi)
   }, [])
@@ -328,31 +387,27 @@ export default function Game() {
       if (state.phase === 'dying') {
         state.dyingTimer -= elapsed
         if (state.dyingTimer <= 0) {
-          // Reset to the same map: restore all pellets, return player and ghosts to start
-          const mazeData = mazeDataRef.current
-          const fresh = initGameState(mazeData)
+          // Persistent state: keep the grid (broken walls stay), pellets eaten stay eaten,
+          // missile packs collected stay collected. Only reset player and ghosts.
 
-          // Restore pellets (all of them, minus the player's original start cell)
-          const playerKey = `${mazeData.playerStart.x},${mazeData.playerStart.y}`
-          fresh.pellets.delete(playerKey)
-          fresh.powerPellets.delete(playerKey)
-          state.pellets = fresh.pellets
-          state.powerPellets = fresh.powerPellets
-
-          // Return player to original spawn
-          state.player.x = mazeData.playerStart.x
-          state.player.y = mazeData.playerStart.y
+          // Reset player to original spawn position
+          state.player.x = mazeDataRef.current.playerStart.x
+          state.player.y = mazeDataRef.current.playerStart.y
           state.player.dir = { dx: 1, dy: 0 }
           state.player.mouthAngle = 0.25
           state.player.mouthOpen = true
+          // Keep player.missiles as-is
           pendingDirRef.current = { dx: 0, dy: 0, pending: false }
 
+          // Clear any in-flight missiles
+          state.activeMissiles = []
+
           // Return all ghosts to ghost house
-          const ghostStarts = [
+          const ghostSlots = [
             { x: 10, y: 11 }, { x: 11, y: 11 }, { x: 12, y: 11 }, { x: 11, y: 10 },
           ]
           state.ghosts.forEach((ghost, i) => {
-            const slot = ghostStarts[i % ghostStarts.length]
+            const slot = ghostSlots[i % ghostSlots.length]
             ghost.x = slot.x
             ghost.y = slot.y
             ghost.scared = false
@@ -369,8 +424,12 @@ export default function Game() {
         renderFrame(canvasRef.current, state)
         // Update React UI so the dying overlay can render
         const dyingPrev = lastUiRef.current
-        if (dyingPrev.phase !== 'dying' || dyingPrev.lives !== state.lives) {
-          const next = { score: state.score, lives: state.lives, phase: 'dying' }
+        if (
+          dyingPrev.phase !== 'dying' ||
+          dyingPrev.lives !== state.lives ||
+          dyingPrev.missiles !== state.player.missiles
+        ) {
+          const next = { score: state.score, lives: state.lives, phase: 'dying', missiles: state.player.missiles }
           lastUiRef.current = next
           setUi(next)
         }
@@ -389,8 +448,13 @@ export default function Game() {
         // Render and show overlay while waiting
         renderFrame(canvasRef.current, state)
         const prev = lastUiRef.current
-        if (prev.phase !== state.phase || prev.score !== state.score || prev.lives !== state.lives) {
-          const next = { score: state.score, lives: state.lives, phase: state.phase }
+        if (
+          prev.phase !== state.phase ||
+          prev.score !== state.score ||
+          prev.lives !== state.lives ||
+          prev.missiles !== state.player.missiles
+        ) {
+          const next = { score: state.score, lives: state.lives, phase: state.phase, missiles: state.player.missiles }
           lastUiRef.current = next
           setUi(next)
         }
@@ -402,8 +466,13 @@ export default function Game() {
       if (state.phase !== 'playing') {
         renderFrame(canvasRef.current, state)
         const prev = lastUiRef.current
-        if (prev.phase !== state.phase || prev.score !== state.score || prev.lives !== state.lives) {
-          const next = { score: state.score, lives: state.lives, phase: state.phase }
+        if (
+          prev.phase !== state.phase ||
+          prev.score !== state.score ||
+          prev.lives !== state.lives ||
+          prev.missiles !== state.player.missiles
+        ) {
+          const next = { score: state.score, lives: state.lives, phase: state.phase, missiles: state.player.missiles }
           lastUiRef.current = next
           setUi(next)
         }
@@ -466,6 +535,14 @@ export default function Game() {
               ghost.scaredTimer = SCARED_MS
             }
           }
+        }
+
+        // Missile pickup
+        const mKey = `${player.x},${player.y}`
+        if (state.missilePacks.has(mKey)) {
+          state.missilePacks.delete(mKey)
+          player.missiles += 1
+          state.score += 25
         }
 
         // Win check
@@ -548,14 +625,60 @@ export default function Game() {
         }
       }
 
+      // ---- Missile tick ----
+      if (state.activeMissiles.length > 0 && timestamp - lastMissileTickRef.current >= MISSILE_TICK_MS) {
+        lastMissileTickRef.current = timestamp
+        const { grid, ghosts, activeMissiles } = state
+
+        for (let i = activeMissiles.length - 1; i >= 0; i--) {
+          const m = activeMissiles[i]
+
+          // Try to advance the missile one cell
+          const dest = getWrappedPosition(grid, m.x, m.y, m.dx, m.dy)
+
+          if (dest === null) {
+            // Next cell is a wall — break it and remove missile
+            const wx = m.x + m.dx
+            const wy = m.y + m.dy
+            if (wx >= 0 && wx < COLS && wy >= 0 && wy < ROWS && grid[wy][wx] === 1) {
+              grid[wy][wx] = 0  // wall broken — permanent for this session
+            }
+            activeMissiles.splice(i, 1)
+            continue
+          }
+
+          // Move missile to destination
+          m.x = dest.x
+          m.y = dest.y
+
+          // Check ghost hit
+          let hitGhost = false
+          for (const ghost of ghosts) {
+            if (!ghost.eaten && ghost.x === m.x && ghost.y === m.y) {
+              ghost.eaten = true
+              ghost.respawnTimer = 3000
+              ghost.scared = false
+              ghost.scaredTimer = 0
+              state.score += MISSILE_KILL_SCORE
+              hitGhost = true
+              break
+            }
+          }
+          if (hitGhost) {
+            activeMissiles.splice(i, 1)
+          }
+        }
+      }
+
       // ---- Update React UI (guarded) ----
       const prev = lastUiRef.current
       if (
         prev.score !== state.score ||
         prev.lives !== state.lives ||
-        prev.phase !== state.phase
+        prev.phase !== state.phase ||
+        prev.missiles !== state.player.missiles
       ) {
-        const next = { score: state.score, lives: state.lives, phase: state.phase }
+        const next = { score: state.score, lives: state.lives, phase: state.phase, missiles: state.player.missiles }
         lastUiRef.current = next
         setUi(next)
       }
@@ -602,6 +725,18 @@ export default function Game() {
           e.preventDefault()
           dx = 1; dy = 0
           break
+        case ' ':
+          e.preventDefault()
+          if (stateRef.current && stateRef.current.phase === 'playing') {
+            const s = stateRef.current
+            const { player } = s
+            // Only fire if player has ammo and has a direction
+            if (player.missiles > 0 && (player.dir.dx !== 0 || player.dir.dy !== 0)) {
+              s.activeMissiles.push({ x: player.x, y: player.y, dx: player.dir.dx, dy: player.dir.dy })
+              player.missiles -= 1
+            }
+          }
+          return  // don't fall through
         default:
           return
       }
@@ -617,6 +752,9 @@ export default function Game() {
       <div className="game-wrapper">
         <div className="game-ui">
           <div>SCORE: {ui.score}</div>
+          <div className="missile-count">
+            <span className="missile-icon">◆</span> {ui.missiles}
+          </div>
           <div className="lives">
             {Array.from({ length: ui.lives }).map((_, i) => (
               <span key={i}>&#9679;</span>
