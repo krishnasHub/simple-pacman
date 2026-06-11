@@ -76,10 +76,20 @@ export function generateMaze(cols = 23, rows = 23) {
     }
   }
 
-  // Player start: random path cell, never inside the ghost house area
-  const validPlayerStarts = pathCells.filter(
-    c => !(c.x >= 9 && c.x <= 13 && c.y >= 8 && c.y <= 12)
-  )
+  // Player start: one of the four corner regions, well away from the central ghost house.
+  // Require |x-11| >= 5 AND |y-11| >= 5 so the player always spawns in a corner quadrant.
+  // Fall back to Manhattan distance >= 10 if no corner cell is reachable, then to the
+  // original ghost-house exclusion as a last resort.
+  const inCorner = c => Math.abs(c.x - 11) >= 5 && Math.abs(c.y - 11) >= 5
+  const farFromCenter = c => Math.abs(c.x - 11) + Math.abs(c.y - 11) >= 10
+  const notInGhostHouse = c => !(c.x >= 9 && c.x <= 13 && c.y >= 8 && c.y <= 12)
+
+  let validPlayerStarts = pathCells.filter(c => inCorner(c) && notInGhostHouse(c))
+  if (validPlayerStarts.length === 0)
+    validPlayerStarts = pathCells.filter(c => farFromCenter(c) && notInGhostHouse(c))
+  if (validPlayerStarts.length === 0)
+    validPlayerStarts = pathCells.filter(notInGhostHouse)
+
   const playerStart = validPlayerStarts[Math.floor(Math.random() * validPlayerStarts.length)];
 
   // Ghost starts: fixed slots inside the ghost house
