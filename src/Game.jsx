@@ -381,49 +381,51 @@ function duskMove(grid, ghost, player, ghosts) {
 
 // ---- Ghost missile-firing decisions (returns {dx,dy} to fire, or null) ----
 
-function blazeFire(ghost, player, grid) {
-  // Fire in line of sight
-  const los = lineOfSightDir(ghost, player)
-  if (los && Math.random() < 0.7) return los
-  // Fire to break first wall on BFS path
-  const step = bfsStep(grid, ghost, player)
-  if (step.dx !== 0 || step.dy !== 0) {
-    const wx = ghost.x + step.dx * 2
-    const wy = ghost.y + step.dy * 2
-    if (wx >= 0 && wx < COLS && wy >= 0 && wy < ROWS && grid[wy][wx] === 1 && Math.random() < 0.45) {
-      return step
-    }
+// Returns the adjacent wall direction that most reduces BFS distance from `ghost` to `target`.
+// Only fires when the path is longer than `threshold` and a wall break saves >= `minGain` steps.
+function bestShortcutDir(ghost, target, grid, threshold, minGain) {
+  const currentDist = bfsPathLength(grid, ghost, target)
+  if (currentDist <= threshold) return null
+  const dirs = [{ dx: 1, dy: 0 }, { dx: -1, dy: 0 }, { dx: 0, dy: 1 }, { dx: 0, dy: -1 }]
+  let bestDir = null
+  let bestGain = minGain
+  for (const d of dirs) {
+    const wx = ghost.x + d.dx
+    const wy = ghost.y + d.dy
+    if (wx < 0 || wx >= COLS || wy < 0 || wy >= ROWS || grid[wy][wx] !== 1) continue
+    grid[wy][wx] = 0
+    const newDist = bfsPathLength(grid, ghost, target)
+    grid[wy][wx] = 1
+    const gain = currentDist - newDist
+    if (gain > bestGain) { bestGain = gain; bestDir = d }
   }
-  return null
+  return bestDir
 }
 
-function nimbusFire(ghost, player, grid, missilePacks, powerPellets) {
-  // Fire to clear path to nearest pickup
+function blazeFire(ghost, player, grid) {
+  // Only fire to carve a shortcut toward the player when the path is long
+  const dir = bestShortcutDir(ghost, player, grid, 6, 2)
+  return dir && Math.random() < 0.6 ? dir : null
+}
+
+function nimbusFire(ghost, grid, missilePacks, powerPellets) {
+  // Fire to carve a shortcut toward the nearest pickup (power pellet or missile pack)
   const allPickups = new Set([...missilePacks, ...powerPellets])
   const nearest = findNearestAmongCells(grid, ghost, allPickups)
-  if (nearest) {
-    const step = bfsStep(grid, ghost, nearest)
-    if (step.dx !== 0 || step.dy !== 0) {
-      const wx = ghost.x + step.dx
-      const wy = ghost.y + step.dy
-      if (wx >= 0 && wx < COLS && wy >= 0 && wy < ROWS && grid[wy][wx] === 1 && Math.random() < 0.55) {
-        return step
-      }
-    }
-  }
-  // Fire at player if close and aligned
-  if (Math.abs(ghost.x - player.x) + Math.abs(ghost.y - player.y) <= 4) {
-    const los = lineOfSightDir(ghost, player)
-    if (los && Math.random() < 0.6) return los
-  }
-  return null
+  if (!nearest) return null
+  const dir = bestShortcutDir(ghost, nearest, grid, 5, 2)
+  return dir && Math.random() < 0.55 ? dir : null
 }
 
-function glitchFire(ghost) {
-  if (Math.random() < 0.07) {
-    if (ghost.dir.dx !== 0 || ghost.dir.dy !== 0) return ghost.dir
+function glitchFire(ghost, grid) {
+  // Random chance — fire into a random adjacent wall to create chaos
+  if (Math.random() < 0.06) {
     const dirs = [{ dx: 1, dy: 0 }, { dx: -1, dy: 0 }, { dx: 0, dy: 1 }, { dx: 0, dy: -1 }]
-    return dirs[Math.floor(Math.random() * dirs.length)]
+    const wallDirs = dirs.filter(d => {
+      const wx = ghost.x + d.dx; const wy = ghost.y + d.dy
+      return wx >= 0 && wx < COLS && wy >= 0 && wy < ROWS && grid[wy][wx] === 1
+    })
+    if (wallDirs.length > 0) return wallDirs[Math.floor(Math.random() * wallDirs.length)]
   }
   return null
 }
@@ -800,12 +802,12 @@ export default function Game() {
             let fireDir = null
             switch (i) {
               case 0: fireDir = blazeFire(ghost, player, grid); break
-              case 1: fireDir = nimbusFire(ghost, player, grid, missilePacks, powerPellets); break
-              case 2: fireDir = glitchFire(ghost); break
+              case 1: fireDir = nimbusFire(ghost, grid, missilePacks, powerPellets); break
+              case 2: fireDir = glitchFire(ghost, grid); break
               case 3: fireDir = duskFire(ghost, player, grid, ghosts); break
             }
             if (fireDir) {
-              state.activeMissiles.push({ x: ghost.x, y: ghost.y, dx: fireDir.dx, dy: fireDir.dy, firedBy: i })
+              state.activeMissiles.push({ x: ghost.x, y: ghost.y, dx: fireDir.dx, dy: fireDir.dy, firedBy: i, born: timestamp })
               ghost.missiles -= 1
               ghost.missileCooldown = 10  // ~3.6s before next shot
             }
@@ -853,6 +855,9 @@ export default function Game() {
 
         for (let i = activeMissiles.length - 1; i >= 0; i--) {
           const m = activeMissiles[i]
+
+          // Expire after 10 seconds
+          if (timestamp - m.born >= 10_000) { activeMissiles.splice(i, 1); continue }
 
           // Try to advance the missile one cell
           const dest = getWrappedPosition(grid, m.x, m.y, m.dx, m.dy)
@@ -955,7 +960,7 @@ export default function Game() {
           const s = stateRef.current
           const { player } = s
           if (player.missiles > 0 && (player.dir.dx !== 0 || player.dir.dy !== 0)) {
-            s.activeMissiles.push({ x: player.x, y: player.y, dx: player.dir.dx, dy: player.dir.dy, firedBy: 'player' })
+            s.activeMissiles.push({ x: player.x, y: player.y, dx: player.dir.dx, dy: player.dir.dy, firedBy: 'player', born: performance.now() })
             player.missiles -= 1
           }
         }
