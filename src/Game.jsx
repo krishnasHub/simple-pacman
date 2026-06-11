@@ -15,6 +15,8 @@ import {
   randomStep,
   initGameState,
   resolvePlayerGhostCollision,
+  bfsPathLength,
+  findNearestAmongCells,
 } from './gameEngine.js'
 
 const CS = CELL_SIZE
@@ -72,8 +74,6 @@ function getMoodFromPanel(g) {
 // ---------------------------------------------------------------------------
 
 // Portal cells: mid-column on top/bottom border, mid-row on left/right border
-const PORTAL_CELLS = new Set(['11,0', '11,22', '0,11', '22,11'])
-
 function drawMaze(ctx, grid) {
   for (let row = 0; row < ROWS; row++) {
     for (let col = 0; col < COLS; col++) {
@@ -83,8 +83,8 @@ function drawMaze(ctx, grid) {
         ctx.strokeStyle = '#2d2d6e'
         ctx.lineWidth = 0.5
         ctx.strokeRect(col * CS, row * CS, CS, CS)
-      } else if (PORTAL_CELLS.has(`${col},${row}`)) {
-        // Highlight portal cells with a subtle teal glow
+      } else if (col === 0 || col === COLS - 1 || row === 0 || row === ROWS - 1) {
+        // Any open border cell is a portal — highlight dynamically
         ctx.fillStyle = 'rgba(100, 220, 210, 0.18)'
         ctx.fillRect(col * CS, row * CS, CS, CS)
         ctx.strokeStyle = '#64dcd2'
@@ -146,15 +146,21 @@ function drawMissilePacks(ctx, missilePacks) {
   }
 }
 
+// Change 3 — colour missiles based on firedBy
 function drawActiveMissiles(ctx, missiles) {
   for (const m of missiles) {
     const cx = m.x * CS + CS / 2
     const cy = m.y * CS + CS / 2
     ctx.save()
     ctx.shadowBlur = 14
-    ctx.shadowColor = '#ffaa00'
+    if (m.firedBy === 'player') {
+      ctx.shadowColor = '#ffaa00'
+      ctx.fillStyle = '#ffdd00'
+    } else {
+      ctx.shadowColor = '#ff3366'
+      ctx.fillStyle = '#ff6688'
+    }
     // Outer glow circle
-    ctx.fillStyle = '#ffdd00'
     ctx.beginPath()
     ctx.arc(cx, cy, 5, 0, Math.PI * 2)
     ctx.fill()
@@ -281,6 +287,182 @@ function drawPlayer(ctx, player, phase) {
   ctx.fill()
 }
 
+// ---------------------------------------------------------------------------
+// Missile pack respawn — called every 2 minutes while playing
+// ---------------------------------------------------------------------------
+
+function respawnMissilePacks(state) {
+  state.missilePacks.clear()
+  const { grid, player } = state
+  const pathCells = []
+  for (let r = 0; r < ROWS; r++) {
+    for (let c = 0; c < COLS; c++) {
+      if (grid[r][c] === 0) pathCells.push({ x: c, y: r })
+    }
+  }
+  const inGhostHouse = (x, y) => x >= 9 && x <= 13 && y >= 8 && y <= 12
+  const isBorder = (x, y) => x === 0 || x === COLS - 1 || y === 0 || y === ROWS - 1
+  const eligible = pathCells.filter(c =>
+    !inGhostHouse(c.x, c.y) &&
+    !isBorder(c.x, c.y) &&
+    Math.abs(c.x - player.x) + Math.abs(c.y - player.y) > 2
+  )
+  for (let i = eligible.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [eligible[i], eligible[j]] = [eligible[j], eligible[i]]
+  }
+  const centerDist = c => Math.abs(c.x - 11) + Math.abs(c.y - 11)
+  const inner = eligible.filter(c => centerDist(c) <= 7).slice(0, 6)
+  const outer = eligible.filter(c => centerDist(c) > 7).slice(0, 3)
+  for (const c of [...inner, ...outer]) state.missilePacks.add(`${c.x},${c.y}`)
+}
+
+// ---------------------------------------------------------------------------
+// Ghost persona helpers (module-level, before renderFrame)
+// ---------------------------------------------------------------------------
+
+// Returns {dx,dy} if player is in same row or column (used for aiming)
+function lineOfSightDir(from, to) {
+  if (from.x === to.x && from.y !== to.y) return { dx: 0, dy: to.y > from.y ? 1 : -1 }
+  if (from.y === to.y && from.x !== to.x) return { dx: to.x > from.x ? 1 : -1, dy: 0 }
+  return null
+}
+
+// BLAZE (0) — pure aggressive BFS, always fastest path
+function blazeMove(grid, ghost, player) {
+  return bfsStep(grid, ghost, player)
+}
+
+// NIMBUS (1) — lingers near pickups, ambushes player
+function nimbusMove(grid, ghost, player, missilePacks, powerPellets) {
+  const allPickups = new Set([...missilePacks, ...powerPellets])
+  const nearest = findNearestAmongCells(grid, ghost, allPickups)
+  if (nearest) {
+    const distToPickup = Math.abs(ghost.x - nearest.x) + Math.abs(ghost.y - nearest.y)
+    const distToPlayer = Math.abs(ghost.x - player.x) + Math.abs(ghost.y - player.y)
+    // Patrol near the pickup if player is not close yet
+    if (distToPickup <= 5 && distToPlayer > 5) {
+      const step = bfsStep(grid, ghost, nearest)
+      if (step.dx !== 0 || step.dy !== 0) return step
+    }
+  }
+  return bfsStep(grid, ghost, player)
+}
+
+// GLITCH (2) — random chaos with 35% directional pull toward player
+function glitchMove(grid, ghost, player) {
+  if (Math.random() < 0.35) {
+    const step = bfsStep(grid, ghost, player)
+    if (step.dx !== 0 || step.dy !== 0) return step
+  }
+  return randomStep(grid, ghost, ghost.dir)
+}
+
+// DUSK (3) — coordinator: positions itself opposite the centroid of other ghosts
+// relative to the player, creating a pincer movement
+function duskMove(grid, ghost, player, ghosts) {
+  const others = ghosts.filter((g, i) => i !== 3 && !g.eaten)
+  if (others.length === 0) return bfsStep(grid, ghost, player)
+
+  const cx = others.reduce((s, g) => s + g.x, 0) / others.length
+  const cy = others.reduce((s, g) => s + g.y, 0) / others.length
+
+  // Vector from centroid toward player; Dusk goes beyond the player on that vector
+  const dvx = player.x - cx
+  const dvy = player.y - cy
+  const mag = Math.sqrt(dvx * dvx + dvy * dvy) || 1
+  const targetX = Math.round(Math.max(1, Math.min(COLS - 2, player.x + (dvx / mag) * 4)))
+  const targetY = Math.round(Math.max(1, Math.min(ROWS - 2, player.y + (dvy / mag) * 4)))
+
+  const step = bfsStep(grid, ghost, { x: targetX, y: targetY })
+  if (step.dx !== 0 || step.dy !== 0) return step
+  return bfsStep(grid, ghost, player)
+}
+
+// ---- Ghost missile-firing decisions (returns {dx,dy} to fire, or null) ----
+
+function blazeFire(ghost, player, grid) {
+  // Fire in line of sight
+  const los = lineOfSightDir(ghost, player)
+  if (los && Math.random() < 0.7) return los
+  // Fire to break first wall on BFS path
+  const step = bfsStep(grid, ghost, player)
+  if (step.dx !== 0 || step.dy !== 0) {
+    const wx = ghost.x + step.dx * 2
+    const wy = ghost.y + step.dy * 2
+    if (wx >= 0 && wx < COLS && wy >= 0 && wy < ROWS && grid[wy][wx] === 1 && Math.random() < 0.45) {
+      return step
+    }
+  }
+  return null
+}
+
+function nimbusFire(ghost, player, grid, missilePacks, powerPellets) {
+  // Fire to clear path to nearest pickup
+  const allPickups = new Set([...missilePacks, ...powerPellets])
+  const nearest = findNearestAmongCells(grid, ghost, allPickups)
+  if (nearest) {
+    const step = bfsStep(grid, ghost, nearest)
+    if (step.dx !== 0 || step.dy !== 0) {
+      const wx = ghost.x + step.dx
+      const wy = ghost.y + step.dy
+      if (wx >= 0 && wx < COLS && wy >= 0 && wy < ROWS && grid[wy][wx] === 1 && Math.random() < 0.55) {
+        return step
+      }
+    }
+  }
+  // Fire at player if close and aligned
+  if (Math.abs(ghost.x - player.x) + Math.abs(ghost.y - player.y) <= 4) {
+    const los = lineOfSightDir(ghost, player)
+    if (los && Math.random() < 0.6) return los
+  }
+  return null
+}
+
+function glitchFire(ghost) {
+  if (Math.random() < 0.07) {
+    if (ghost.dir.dx !== 0 || ghost.dir.dy !== 0) return ghost.dir
+    const dirs = [{ dx: 1, dy: 0 }, { dx: -1, dy: 0 }, { dx: 0, dy: 1 }, { dx: 0, dy: -1 }]
+    return dirs[Math.floor(Math.random() * dirs.length)]
+  }
+  return null
+}
+
+function duskFire(ghost, player, grid, ghosts) {
+  const others = ghosts.filter((g, i) => i !== 3 && !g.eaten)
+  if (others.length === 0) return null
+
+  const dirs = [{ dx: 1, dy: 0 }, { dx: -1, dy: 0 }, { dx: 0, dy: 1 }, { dx: 0, dy: -1 }]
+  let bestDir = null
+  let bestGain = 2
+
+  for (const d of dirs) {
+    const wx = ghost.x + d.dx
+    const wy = ghost.y + d.dy
+    if (wx < 0 || wx >= COLS || wy < 0 || wy >= ROWS || grid[wy][wx] !== 1) continue
+
+    // Measure average BFS path length BEFORE breaking the wall
+    const avgBefore = others.reduce((s, g) => s + bfsPathLength(grid, g, player), 0) / others.length
+
+    // Break temporarily
+    grid[wy][wx] = 0
+    const avgAfter = others.reduce((s, g) => s + bfsPathLength(grid, g, player), 0) / others.length
+    grid[wy][wx] = 1  // restore
+
+    const gain = avgBefore - avgAfter  // positive = breaking this wall helps others
+    if (gain > bestGain) {
+      bestGain = gain
+      bestDir = d
+    }
+  }
+
+  return bestDir && Math.random() < 0.7 ? bestDir : null
+}
+
+// ---------------------------------------------------------------------------
+// Render frame
+// ---------------------------------------------------------------------------
+
 function renderFrame(canvas, state) {
   const ctx = canvas.getContext('2d')
   ctx.clearRect(0, 0, CANVAS_W, CANVAS_H)
@@ -307,11 +489,13 @@ export default function Game() {
   const stateRef = useRef(null)
   const mazeDataRef = useRef(null)
   const pendingDirRef = useRef({ dx: 0, dy: 0, pending: false })
+  const heldDirRef = useRef(null)
   const rafRef = useRef(null)
 
   const lastPlayerTickRef = useRef(0)
   const lastGhostTickRef = useRef(0)
   const lastMissileTickRef = useRef(0)
+  const lastMissilePackSpawnRef = useRef(0)
   const lastUiRef = useRef({ score: 0, lives: 3, phase: 'playing', missiles: 1 })
 
   const [ui, setUi] = useState({ score: 0, lives: 3, phase: 'playing', missiles: 1 })
@@ -334,8 +518,9 @@ export default function Game() {
     lastPlayerTickRef.current = 0
     lastGhostTickRef.current = 0
     lastMissileTickRef.current = 0
+    lastMissilePackSpawnRef.current = performance.now()
 
-    const initialUi = { score: 0, lives: 3, phase: 'playing', missiles: 1 }
+    const initialUi = { score: 0, lives: 3, phase: 'playing', missiles: 3 }
     lastUiRef.current = initialUi
     setUi(initialUi)
   }, [])
@@ -345,6 +530,7 @@ export default function Game() {
   }, [startGame])
 
   // Ghost panel update every 500ms
+  // Change 7 — add missiles to each ghost snapshot
   useEffect(() => {
     const id = setInterval(() => {
       if (!stateRef.current) return
@@ -356,6 +542,7 @@ export default function Game() {
         scaredTimer: g.scaredTimer,
         eaten: g.eaten,
         dist: Math.abs(g.x - player.x) + Math.abs(g.y - player.y),
+        missiles: g.missiles,
       })))
     }, 500)
     return () => clearInterval(id)
@@ -403,6 +590,7 @@ export default function Game() {
           state.activeMissiles = []
 
           // Return all ghosts to ghost house
+          // Change 6 — only reset position/state, NOT missiles or missileCooldown
           const ghostSlots = [
             { x: 10, y: 11 }, { x: 11, y: 11 }, { x: 12, y: 11 }, { x: 11, y: 10 },
           ]
@@ -415,6 +603,7 @@ export default function Game() {
             ghost.eaten = false
             ghost.respawnTimer = 0
             ghost.dir = { dx: 0, dy: 0 }
+            // ghost.missiles and ghost.missileCooldown intentionally NOT reset
           })
 
           state.phase = 'playing'
@@ -480,13 +669,23 @@ export default function Game() {
         return
       }
 
+      // ---- Missile pack respawn (every 2 minutes) ----
+      if (timestamp - lastMissilePackSpawnRef.current >= 30_000) {
+        lastMissilePackSpawnRef.current = timestamp
+        respawnMissilePacks(state)
+      }
+
       // ---- Player tick ----
       if (timestamp - lastPlayerTickRef.current >= TICK_MS) {
         lastPlayerTickRef.current = timestamp
 
         const { player, grid, pellets, powerPellets, ghosts } = state
 
-        // Consume pending move — one step per keypress, no auto-continuation
+        // Feed held direction into pending each tick for continuous movement
+        if (!pendingDirRef.current.pending && heldDirRef.current) {
+          pendingDirRef.current = { ...heldDirRef.current, pending: true }
+        }
+
         const pd = pendingDirRef.current
         if (pd.pending) {
           pd.pending = false
@@ -553,53 +752,74 @@ export default function Game() {
       }
 
       // ---- Ghost tick ----
+      // Change 5 — persona movement + ghost missile firing
       if (timestamp - lastGhostTickRef.current >= GHOST_TICK_MS) {
         lastGhostTickRef.current = timestamp
-
-        const { player, grid, ghosts } = state
+        const { player, grid, ghosts, missilePacks, powerPellets } = state
 
         for (let i = 0; i < ghosts.length; i++) {
           const ghost = ghosts[i]
 
-          // Handle eaten/respawning ghost
+          // ---- Eaten / respawning ----
           if (ghost.eaten) {
             ghost.respawnTimer -= GHOST_TICK_MS
             if (ghost.respawnTimer <= 0) {
-              // Teleport back to ghost house
               ghost.x = state.ghostHouseCenter.x
               ghost.y = state.ghostHouseCenter.y
               ghost.eaten = false
               ghost.scared = false
               ghost.scaredTimer = 0
-              ghost.dir = { dx: 0, dy: -1 }  // exit upward
+              ghost.dir = { dx: 0, dy: -1 }
+              // missiles and missileCooldown intentionally NOT reset
             }
-            continue  // skip movement while respawning
+            continue
           }
 
-          // Ghost AI
+          // ---- Missile cooldown tick ----
+          if (ghost.missileCooldown > 0) ghost.missileCooldown--
+
+          // ---- Persona movement ----
           let nextDir
-          if (!ghost.scared && i < 2) {
-            // Chase mode: BFS toward player
-            nextDir = bfsStep(grid, { x: ghost.x, y: ghost.y }, { x: player.x, y: player.y })
-            // If BFS returns (0,0) (stuck/same cell), fall back to random
-            if (nextDir.dx === 0 && nextDir.dy === 0) {
-              nextDir = randomStep(grid, { x: ghost.x, y: ghost.y }, ghost.dir)
-            }
+          if (ghost.scared) {
+            nextDir = randomStep(grid, ghost, ghost.dir)
           } else {
-            // Random mode (also used when scared)
-            nextDir = randomStep(grid, { x: ghost.x, y: ghost.y }, ghost.dir)
+            switch (i) {
+              case 0: nextDir = blazeMove(grid, ghost, player); break
+              case 1: nextDir = nimbusMove(grid, ghost, player, missilePacks, powerPellets); break
+              case 2: nextDir = glitchMove(grid, ghost, player); break
+              case 3: nextDir = duskMove(grid, ghost, player, ghosts); break
+              default: nextDir = randomStep(grid, ghost, ghost.dir)
+            }
+            if (!nextDir || (nextDir.dx === 0 && nextDir.dy === 0)) {
+              nextDir = randomStep(grid, ghost, ghost.dir)
+            }
           }
 
-          ghost.dir = nextDir
+          // ---- Ghost missile firing (before moving, only when not scared) ----
+          if (!ghost.scared && ghost.missiles > 0 && ghost.missileCooldown === 0) {
+            let fireDir = null
+            switch (i) {
+              case 0: fireDir = blazeFire(ghost, player, grid); break
+              case 1: fireDir = nimbusFire(ghost, player, grid, missilePacks, powerPellets); break
+              case 2: fireDir = glitchFire(ghost); break
+              case 3: fireDir = duskFire(ghost, player, grid, ghosts); break
+            }
+            if (fireDir) {
+              state.activeMissiles.push({ x: ghost.x, y: ghost.y, dx: fireDir.dx, dy: fireDir.dy, firedBy: i })
+              ghost.missiles -= 1
+              ghost.missileCooldown = 10  // ~3.6s before next shot
+            }
+          }
 
+          // ---- Move ghost ----
+          ghost.dir = nextDir
           const ghostDest = getWrappedPosition(grid, ghost.x, ghost.y, nextDir.dx, nextDir.dy)
           if (ghostDest) {
             ghost.x = ghostDest.x
             ghost.y = ghostDest.y
           }
 
-          // Collision check — uses ghost.scared value from START of this tick,
-          // before any timer decrement, so the power-up outcome is always fair.
+          // ---- Collision with player (before scared timer tick) ----
           const hit = resolvePlayerGhostCollision(ghost, player)
           if (hit === 'ghost_eaten') {
             ghost.eaten = true
@@ -614,7 +834,7 @@ export default function Game() {
             break
           }
 
-          // Decrement scared timer AFTER collision is resolved (takes effect next tick)
+          // ---- Scared timer (after collision) ----
           if (ghost.scared) {
             ghost.scaredTimer -= GHOST_TICK_MS
             if (ghost.scaredTimer <= 0) {
@@ -626,9 +846,10 @@ export default function Game() {
       }
 
       // ---- Missile tick ----
+      // Change 2 — collision respects firedBy
       if (state.activeMissiles.length > 0 && timestamp - lastMissileTickRef.current >= MISSILE_TICK_MS) {
         lastMissileTickRef.current = timestamp
-        const { grid, ghosts, activeMissiles } = state
+        const { grid, ghosts, player, activeMissiles } = state
 
         for (let i = activeMissiles.length - 1; i >= 0; i--) {
           const m = activeMissiles[i]
@@ -637,11 +858,18 @@ export default function Game() {
           const dest = getWrappedPosition(grid, m.x, m.y, m.dx, m.dy)
 
           if (dest === null) {
-            // Next cell is a wall — break it and remove missile
-            const wx = m.x + m.dx
-            const wy = m.y + m.dy
-            if (wx >= 0 && wx < COLS && wy >= 0 && wy < ROWS && grid[wy][wx] === 1) {
-              grid[wy][wx] = 0  // wall broken — permanent for this session
+            // Compute the target cell, wrapping if missile is at a border
+            const rawWx = m.x + m.dx
+            const rawWy = m.y + m.dy
+            const wallX = rawWx < 0 ? COLS - 1 : rawWx >= COLS ? 0 : rawWx
+            const wallY = rawWy < 0 ? ROWS - 1 : rawWy >= ROWS ? 0 : rawWy
+            if (grid[wallY][wallX] === 1) {
+              grid[wallY][wallX] = 0
+              // Border hit — open the mirrored cell to create a portal pair
+              if (wallX === 0) grid[wallY][COLS - 1] = 0
+              else if (wallX === COLS - 1) grid[wallY][0] = 0
+              else if (wallY === 0) grid[ROWS - 1][wallX] = 0
+              else if (wallY === ROWS - 1) grid[0][wallX] = 0
             }
             activeMissiles.splice(i, 1)
             continue
@@ -651,20 +879,26 @@ export default function Game() {
           m.x = dest.x
           m.y = dest.y
 
-          // Check ghost hit
-          let hitGhost = false
-          for (const ghost of ghosts) {
-            if (!ghost.eaten && ghost.x === m.x && ghost.y === m.y) {
-              ghost.eaten = true
-              ghost.respawnTimer = 3000
-              ghost.scared = false
-              ghost.scaredTimer = 0
-              state.score += MISSILE_KILL_SCORE
-              hitGhost = true
-              break
+          let hitSomething = false
+
+          // Ghost hit — only player missiles kill ghosts
+          if (m.firedBy === 'player') {
+            for (const ghost of ghosts) {
+              if (!ghost.eaten && ghost.x === m.x && ghost.y === m.y) {
+                ghost.eaten = true
+                ghost.respawnTimer = 3000
+                ghost.scared = false
+                ghost.scaredTimer = 0
+                state.score += MISSILE_KILL_SCORE
+                hitSomething = true
+                break
+              }
             }
           }
-          if (hitGhost) {
+
+          // Ghost missiles pass through the player — they only break walls
+
+          if (hitSomething) {
             activeMissiles.splice(i, 1)
           }
         }
@@ -695,56 +929,53 @@ export default function Game() {
     }
   }, [startGame, restartGame])
 
-  // Keyboard handler — one step per keypress (e.repeat === false only)
+  // Keyboard handler — continuous movement while key held, one-step on tap
   useEffect(() => {
-    function handleKeyDown(e) {
-      if (e.repeat) return
-      let dx = 0, dy = 0
-      switch (e.key) {
-        case 'ArrowUp':
-        case 'w':
-        case 'W':
-          e.preventDefault()
-          dx = 0; dy = -1
-          break
-        case 'ArrowDown':
-        case 's':
-        case 'S':
-          e.preventDefault()
-          dx = 0; dy = 1
-          break
-        case 'ArrowLeft':
-        case 'a':
-        case 'A':
-          e.preventDefault()
-          dx = -1; dy = 0
-          break
-        case 'ArrowRight':
-        case 'd':
-        case 'D':
-          e.preventDefault()
-          dx = 1; dy = 0
-          break
-        case ' ':
-          e.preventDefault()
-          if (stateRef.current && stateRef.current.phase === 'playing') {
-            const s = stateRef.current
-            const { player } = s
-            // Only fire if player has ammo and has a direction
-            if (player.missiles > 0 && (player.dir.dx !== 0 || player.dir.dy !== 0)) {
-              s.activeMissiles.push({ x: player.x, y: player.y, dx: player.dir.dx, dy: player.dir.dy })
-              player.missiles -= 1
-            }
-          }
-          return  // don't fall through
-        default:
-          return
+    function dirFromKey(key) {
+      switch (key) {
+        case 'ArrowUp':    case 'w': case 'W': return { dx: 0,  dy: -1 }
+        case 'ArrowDown':  case 's': case 'S': return { dx: 0,  dy:  1 }
+        case 'ArrowLeft':  case 'a': case 'A': return { dx: -1, dy:  0 }
+        case 'ArrowRight': case 'd': case 'D': return { dx:  1, dy:  0 }
+        default: return null
       }
-      pendingDirRef.current = { dx, dy, pending: true }
+    }
+
+    function handleKeyDown(e) {
+      const dir = dirFromKey(e.key)
+      if (dir) {
+        e.preventDefault()
+        heldDirRef.current = dir
+        if (!e.repeat) pendingDirRef.current = { ...dir, pending: true }
+        return
+      }
+      if (e.key === ' ') {
+        e.preventDefault()
+        if (stateRef.current && stateRef.current.phase === 'playing') {
+          const s = stateRef.current
+          const { player } = s
+          if (player.missiles > 0 && (player.dir.dx !== 0 || player.dir.dy !== 0)) {
+            s.activeMissiles.push({ x: player.x, y: player.y, dx: player.dir.dx, dy: player.dir.dy, firedBy: 'player' })
+            player.missiles -= 1
+          }
+        }
+      }
+    }
+
+    function handleKeyUp(e) {
+      const dir = dirFromKey(e.key)
+      if (dir && heldDirRef.current &&
+          dir.dx === heldDirRef.current.dx && dir.dy === heldDirRef.current.dy) {
+        heldDirRef.current = null
+      }
     }
 
     window.addEventListener('keydown', handleKeyDown)
-    return () => window.removeEventListener('keydown', handleKeyDown)
+    window.addEventListener('keyup', handleKeyUp)
+    return () => {
+      window.removeEventListener('keydown', handleKeyDown)
+      window.removeEventListener('keyup', handleKeyUp)
+    }
   }, [])
 
   return (
@@ -807,6 +1038,12 @@ export default function Game() {
               </div>
               <div className="ghost-mood" style={{ color: moodData.color }}>{moodData.label}</div>
               <div className="ghost-phrase">"{phrase}"</div>
+              {/* Change 7 — ghost ammo display */}
+              <div className="ghost-ammo">
+                {[0, 1, 2].map(j => (
+                  <span key={j} style={{ color: j < g.missiles ? '#ff8c00' : '#2a2a4a' }}>◆</span>
+                ))}
+              </div>
             </div>
           )
         })}

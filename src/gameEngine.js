@@ -2,7 +2,7 @@ export const CELL_SIZE = 24
 export const COLS = 23
 export const ROWS = 23
 export const TICK_MS = 150
-export const GHOST_TICK_MS = 360
+export const GHOST_TICK_MS = 500
 export const SCARED_MS = 8000
 export const MISSILE_TICK_MS = 80       // missile moves every 80 ms
 export const MISSILE_KILL_SCORE = 300   // score bonus for a missile ghost kill
@@ -29,12 +29,11 @@ export function getWrappedPosition(grid, fromX, fromY, dx, dy) {
   let toX = fromX + dx
   let toY = fromY + dy
 
-  // Apply wrap-around when stepping off a portal border cell
-  if (toX < 0   && fromY === MID_ROW) toX = COLS - 1
-  else if (toX >= COLS && fromY === MID_ROW) toX = 0
-  else if (toY < 0   && fromX === MID_COL) toY = ROWS - 1
-  else if (toY >= ROWS && fromX === MID_COL) toY = 0
-  else if (toX < 0 || toX >= COLS || toY < 0 || toY >= ROWS) return null
+  // Wrap at any open border cell — portals are created dynamically by missiles
+  if (toX < 0) toX = COLS - 1
+  else if (toX >= COLS) toX = 0
+  else if (toY < 0) toY = ROWS - 1
+  else if (toY >= ROWS) toY = 0
 
   if (grid[toY][toX] !== 0) return null
   return { x: toX, y: toY }
@@ -88,6 +87,58 @@ export function bfsStep(grid, from, to) {
 }
 
 /**
+ * BFS path length from `from` to `to` through the grid (portal-aware).
+ * Returns the number of steps, or Infinity if unreachable.
+ */
+export function bfsPathLength(grid, from, to) {
+  if (from.x === to.x && from.y === to.y) return 0
+  const visited = new Set([`${from.x},${from.y}`])
+  const queue = [{ x: from.x, y: from.y, dist: 0 }]
+  const dirs = [{ dx: 1, dy: 0 }, { dx: -1, dy: 0 }, { dx: 0, dy: 1 }, { dx: 0, dy: -1 }]
+  let head = 0
+  while (head < queue.length) {
+    const { x, y, dist } = queue[head++]
+    for (const d of dirs) {
+      const dest = getWrappedPosition(grid, x, y, d.dx, d.dy)
+      if (!dest) continue
+      const key = `${dest.x},${dest.y}`
+      if (!visited.has(key)) {
+        if (dest.x === to.x && dest.y === to.y) return dist + 1
+        visited.add(key)
+        queue.push({ x: dest.x, y: dest.y, dist: dist + 1 })
+      }
+    }
+  }
+  return Infinity
+}
+
+/**
+ * BFS to find the nearest cell (portal-aware) whose key `"x,y"` is in `cellSet`.
+ * Returns { x, y } of the nearest match, or null if none reachable.
+ */
+export function findNearestAmongCells(grid, from, cellSet) {
+  if (!cellSet || cellSet.size === 0) return null
+  const visited = new Set([`${from.x},${from.y}`])
+  const queue = [{ x: from.x, y: from.y }]
+  const dirs = [{ dx: 1, dy: 0 }, { dx: -1, dy: 0 }, { dx: 0, dy: 1 }, { dx: 0, dy: -1 }]
+  let head = 0
+  while (head < queue.length) {
+    const { x, y } = queue[head++]
+    if (cellSet.has(`${x},${y}`)) return { x, y }
+    for (const d of dirs) {
+      const dest = getWrappedPosition(grid, x, y, d.dx, d.dy)
+      if (!dest) continue
+      const key = `${dest.x},${dest.y}`
+      if (!visited.has(key)) {
+        visited.add(key)
+        queue.push(dest)
+      }
+    }
+  }
+  return null
+}
+
+/**
  * Returns a valid random {dx, dy} step for a ghost, respecting wrap-around portals.
  * Prefers not to reverse the current direction.
  */
@@ -138,7 +189,7 @@ export function initGameState({ grid, playerStart, ghostStarts, pathCells, power
       nextDir: { dx: 1, dy: 0 },
       mouthAngle: 0.25,
       mouthOpen: true,
-      missiles: 1,
+      missiles: 3,
     },
     ghosts: ghostStarts.slice(0, 4).map((pos, i) => ({
       x: pos.x,
@@ -150,6 +201,8 @@ export function initGameState({ grid, playerStart, ghostStarts, pathCells, power
       scaredTimer: 0,
       eaten: false,
       respawnTimer: 0,
+      missiles: 3,
+      missileCooldown: 0,
     })),
     pellets: new Set(pathCells.map(c => `${c.x},${c.y}`)),
     powerPellets: new Set(powerPellets.map(c => `${c.x},${c.y}`)),
