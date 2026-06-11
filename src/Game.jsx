@@ -150,37 +150,29 @@ function drawMissilePacks(ctx, missilePacks) {
 function drawActiveMissiles(ctx, missiles, canvasW, canvasH) {
   if (missiles.length === 0) return
 
-  // Dim the scene — draw a semi-transparent overlay so missiles stand out
-  ctx.fillStyle = 'rgba(0, 0, 0, 0.5)'
+  // Dim the scene so the missile pops against the dark background
+  ctx.fillStyle = 'rgba(0, 0, 0, 0.65)'
   ctx.fillRect(0, 0, canvasW, canvasH)
 
   for (const m of missiles) {
     const cx = m.x * CS + CS / 2
     const cy = m.y * CS + CS / 2
     const isPlayer = m.firedBy === 'player'
-    const glowColor  = isPlayer ? '#ffaa00' : '#ff2255'
-    const outerColor = isPlayer ? '#ffdd00' : '#ff5577'
 
     ctx.save()
-
-    // Wide outer halo — three stacked passes for a deep glow
-    for (const [blur, radius] of [[40, 12], [22, 8], [10, 6]]) {
-      ctx.shadowBlur = blur
-      ctx.shadowColor = glowColor
-      ctx.fillStyle = outerColor
-      ctx.beginPath()
-      ctx.arc(cx, cy, radius, 0, Math.PI * 2)
-      ctx.fill()
-    }
-
+    ctx.shadowBlur = 14
+    ctx.shadowColor = isPlayer ? '#ffaa00' : '#ff3366'
+    ctx.fillStyle   = isPlayer ? '#ffdd00' : '#ff6688'
+    // Outer glow circle
+    ctx.beginPath()
+    ctx.arc(cx, cy, 5, 0, Math.PI * 2)
+    ctx.fill()
     // Bright core
-    ctx.shadowBlur = 6
-    ctx.shadowColor = '#ffffff'
+    ctx.shadowBlur = 0
     ctx.fillStyle = '#ffffff'
     ctx.beginPath()
-    ctx.arc(cx, cy, 3, 0, Math.PI * 2)
+    ctx.arc(cx, cy, 2.5, 0, Math.PI * 2)
     ctx.fill()
-
     ctx.restore()
   }
 }
