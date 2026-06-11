@@ -147,29 +147,40 @@ function drawMissilePacks(ctx, missilePacks) {
 }
 
 // Change 3 — colour missiles based on firedBy
-function drawActiveMissiles(ctx, missiles) {
+function drawActiveMissiles(ctx, missiles, canvasW, canvasH) {
+  if (missiles.length === 0) return
+
+  // Dim the scene — draw a semi-transparent overlay so missiles stand out
+  ctx.fillStyle = 'rgba(0, 0, 0, 0.5)'
+  ctx.fillRect(0, 0, canvasW, canvasH)
+
   for (const m of missiles) {
     const cx = m.x * CS + CS / 2
     const cy = m.y * CS + CS / 2
+    const isPlayer = m.firedBy === 'player'
+    const glowColor  = isPlayer ? '#ffaa00' : '#ff2255'
+    const outerColor = isPlayer ? '#ffdd00' : '#ff5577'
+
     ctx.save()
-    ctx.shadowBlur = 14
-    if (m.firedBy === 'player') {
-      ctx.shadowColor = '#ffaa00'
-      ctx.fillStyle = '#ffdd00'
-    } else {
-      ctx.shadowColor = '#ff3366'
-      ctx.fillStyle = '#ff6688'
+
+    // Wide outer halo — three stacked passes for a deep glow
+    for (const [blur, radius] of [[40, 12], [22, 8], [10, 6]]) {
+      ctx.shadowBlur = blur
+      ctx.shadowColor = glowColor
+      ctx.fillStyle = outerColor
+      ctx.beginPath()
+      ctx.arc(cx, cy, radius, 0, Math.PI * 2)
+      ctx.fill()
     }
-    // Outer glow circle
-    ctx.beginPath()
-    ctx.arc(cx, cy, 5, 0, Math.PI * 2)
-    ctx.fill()
+
     // Bright core
-    ctx.shadowBlur = 0
+    ctx.shadowBlur = 6
+    ctx.shadowColor = '#ffffff'
     ctx.fillStyle = '#ffffff'
     ctx.beginPath()
-    ctx.arc(cx, cy, 2.5, 0, Math.PI * 2)
+    ctx.arc(cx, cy, 3, 0, Math.PI * 2)
     ctx.fill()
+
     ctx.restore()
   }
 }
@@ -477,9 +488,10 @@ function renderFrame(canvas, state) {
   drawPellets(ctx, state.pellets)
   drawPowerPellets(ctx, state.powerPellets)
   drawMissilePacks(ctx, state.missilePacks)
-  drawActiveMissiles(ctx, state.activeMissiles)
   drawGhosts(ctx, state.ghosts)
   drawPlayer(ctx, state.player, state.phase)
+  // Missiles drawn last: dim overlay + bright glow renders on top of everything
+  drawActiveMissiles(ctx, state.activeMissiles, CANVAS_W, CANVAS_H)
 }
 
 // ---------------------------------------------------------------------------
